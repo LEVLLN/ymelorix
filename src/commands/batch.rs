@@ -44,6 +44,7 @@ pub(crate) async fn download_all(
     let total = tracks.len();
     let mut written = HashSet::new();
     let mut failed = 0_usize;
+    let mut skipped = 0_usize;
     let mut in_a_row = 0_usize;
 
     for (index, track) in tracks.iter().enumerate() {
@@ -56,25 +57,36 @@ pub(crate) async fn download_all(
                     in_a_row = 0;
                 }
 
-                let overwritten = matches!(outcome, download::Outcome::Downloaded { .. })
-                    && !written.insert(track.file_stem());
-                if overwritten {
-                    tracing::warn!(
-                        track = %track,
-                        stem = track.file_stem(),
-                        "перезаписан файл одноимённого трека"
-                    );
-                }
+                match &outcome {
+                    // Пропуск по `--update` — это отсутствие работы, и строка о
+                    // нём ничего не сообщает: на почти полной директории сотни
+                    // таких строк прячут в себе десяток действительно
+                    // скачанных. Их число уходит в одну строку в конце.
+                    download::Outcome::Skipped { stem: _stem } => skipped += 1,
+                    download::Outcome::Downloaded {
+                        path: _path,
+                        bytes: _bytes,
+                    } => {
+                        let overwritten = !written.insert(track.file_stem());
+                        if overwritten {
+                            tracing::warn!(
+                                track = %track,
+                                stem = track.file_stem(),
+                                "перезаписан файл одноимённого трека"
+                            );
+                        }
 
-                let note = if overwritten {
-                    " (перезаписал одноимённый трек)"
-                } else {
-                    ""
-                };
-                output::progress(&format!(
-                    "{}{track} — {outcome}{note}",
-                    position_prefix(position, total)
-                ));
+                        let note = if overwritten {
+                            " (перезаписал одноимённый трек)"
+                        } else {
+                            ""
+                        };
+                        output::progress(&format!(
+                            "{}{track} — {outcome}{note}",
+                            position_prefix(position, total)
+                        ));
+                    }
+                }
             }
             Err(download::Failure::Fatal(reason)) => {
                 return Err(reason.context(format!("выгрузка прервана на {position} из {total}")));
@@ -106,6 +118,13 @@ pub(crate) async fn download_all(
                 }
             }
         }
+    }
+
+    // Пропущенные не печатались по одному, но совсем промолчать о них нельзя:
+    // иначе выгрузка, где всё уже на месте, не отличается от выгрузки пустого
+    // списка.
+    if skipped > 0 {
+        output::progress(&format!("уже на диске, пропущено: {skipped} из {total}"));
     }
 
     if failed > 0 {
