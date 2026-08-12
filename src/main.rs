@@ -49,10 +49,6 @@ async fn main() -> anyhow::Result<()> {
             commands::download_favorite::run(&client, &target.destination(), target.quality).await
         }
         Command::ListFavorites => commands::list_favorite::run(&client).await,
-        Command::DownloadTrack { url, target } => {
-            commands::download_track::run(&client, &url, &target.destination(), target.quality)
-                .await
-        }
         Command::DownloadLink { url, target } => {
             commands::download_link::run(&client, &url, &target.destination(), target.quality).await
         }

@@ -35,26 +35,15 @@ pub(crate) enum Command {
     },
     /// Вывести все избранные треки
     ListFavorites,
-    /// Загрузить трек по ссылке
-    #[command(
-        override_usage = "ymelorix download-track <URL> [--path <DIR>] [--quality <QUALITY>] [--update]"
-    )]
-    DownloadTrack {
-        /// Ссылка на трек в Яндекс Музыке
-        #[arg(help = "Ссылка вида https://music.yandex.ru/album/<id>/track/<id>")]
-        url: String,
-
-        #[command(flatten)]
-        target: Target,
-    },
-    /// Загрузить альбом или плейлист по ссылке
+    /// Загрузить трек, альбом или плейлист по ссылке
     #[command(
         override_usage = "ymelorix download-link <URL> [--path <DIR>] [--quality <QUALITY>] [--update]"
     )]
     DownloadLink {
-        /// Ссылка на альбом или плейлист в Яндекс Музыке
-        #[arg(help = "Ссылка вида https://music.yandex.ru/album/<id> \
-                    или https://music.yandex.ru/users/<владелец>/playlists/<номер>")]
+        /// Ссылка на трек, альбом или плейлист в Яндекс Музыке
+        #[arg(help = "Ссылка вида https://music.yandex.ru/track/<id>, \
+                    https://music.yandex.ru/album/<id> или \
+                    https://music.yandex.ru/users/<владелец>/playlists/<номер>")]
         url: String,
 
         #[command(flatten)]
@@ -128,9 +117,9 @@ mod tests {
     /// `expect` и `panic!` запрещены и в тестах.
     fn target_of(args: &[&str]) -> Option<Target> {
         match Cli::try_parse_from(args).ok()?.command {
-            Command::DownloadFavorites { target }
-            | Command::DownloadTrack { target, .. }
-            | Command::DownloadLink { target, .. } => Some(target),
+            Command::DownloadFavorites { target } | Command::DownloadLink { target, .. } => {
+                Some(target)
+            }
             Command::ListFavorites => None,
         }
     }
@@ -151,7 +140,7 @@ mod tests {
     fn reads_quality_and_update_flag() {
         let target = target_of(&[
             "ymelorix",
-            "download-track",
+            "download-link",
             "33898323",
             "--quality",
             "low",

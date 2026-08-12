@@ -6,5 +6,4 @@
 pub(crate) mod batch;
 pub(crate) mod download_favorite;
 pub(crate) mod download_link;
-pub(crate) mod download_track;
 pub(crate) mod list_favorite;

@@ -1,18 +1,23 @@
-//! Ссылка на подборку: альбом или плейлист.
+//! Ссылка из Музыки: трек, альбом или плейлист.
 //!
 //! Разбор чистый и живёт отдельно от запросов: по ссылке уже на границе видно,
 //! какую ручку звать, а ошибка про непонятную ссылку не стоит ни одного запроса.
+//! Команда загрузки одна, поэтому и разбор один: пользователь вставляет ссылку,
+//! а не выбирает подкоманду под её вид.
 
 use core::fmt;
 
 use anyhow::bail;
 
+use crate::track::TrackId;
+
 /// Что скачивать по ссылке.
 ///
-/// Enum, а не пара `Option`: подборка — либо альбом, либо плейлист, и «оба
-/// сразу» или «ни одного» выразить нельзя.
+/// Enum, а не набор `Option`: ссылка ведёт ровно на одно из трёх, и «альбом и
+/// трек сразу» или «ни одного» выразить нельзя.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Source {
+    Track(TrackId),
     Album(AlbumId),
     Playlist(PlaylistId),
 }
@@ -48,24 +53,31 @@ impl PlaylistId {
 }
 
 impl Source {
-    /// Разбирает ссылку на альбом или плейлист.
+    /// Разбирает ссылку на трек, альбом или плейлист.
     ///
-    /// Понимает `music.yandex.ru/album/<id>` и
-    /// `music.yandex.ru/users/<владелец>/playlists/<номер>`, со схемой и без,
-    /// с параметрами запроса и якорем.
+    /// Понимает `music.yandex.ru/track/<id>`, `music.yandex.ru/album/<id>`,
+    /// `music.yandex.ru/album/<id>/track/<id>` и
+    /// `music.yandex.ru/users/<владелец>/playlists/<номер>` — со схемой и без,
+    /// с параметрами запроса и якорем. Голое число — это трек: у альбома и
+    /// плейлиста голой формы нет, поэтому двусмысленности не возникает.
     ///
     /// # Errors
     ///
-    /// Ошибка, если ссылка ведёт на трек, на новый плейлист без владельца или
-    /// не разбирается вовсе. Текст отказа называет команду или форму ссылки,
-    /// которая подойдёт: пользователь на этом месте уже держит ссылку в руках.
+    /// Ошибка, если ссылка ведёт на новый плейлист без владельца или не
+    /// разбирается вовсе. Текст отказа называет форму ссылки, которая подойдёт:
+    /// пользователь на этом месте уже держит ссылку в руках.
     pub(crate) fn parse(input: &str) -> anyhow::Result<Self> {
         let input = input.trim();
         let path = input.split(['?', '#']).next().unwrap_or(input);
         let segments: Vec<&str> = path.split('/').collect();
 
-        if segments.contains(&"track") {
-            bail!("это ссылка на трек — для неё есть команда download-track: {input}");
+        // Сказано «трек» — разбираем как трек и не отступаем: у ссылки
+        // `album/<id>/track/<...>` иначе нашёлся бы номер альбома, и испорченный
+        // номер трека молча превратился бы в загрузку целого диска.
+        let bare_id = matches!(segments.as_slice(), [single] if !single.is_empty()
+            && single.chars().all(|symbol| symbol.is_ascii_digit()));
+        if segments.contains(&"track") || bare_id {
+            return TrackId::parse(input).map(Self::Track);
         }
 
         if let Some(id) = after(&segments, "album") {
@@ -93,7 +105,7 @@ impl Source {
                  Такую ссылку даёт кнопка «Поделиться» в плейлисте: {input}"
             ),
             (Some(_) | None, None) => {
-                bail!("ссылка не похожа ни на альбом, ни на плейлист: {input}")
+                bail!("ссылка не похожа ни на трек, ни на альбом, ни на плейлист: {input}")
             }
         }
     }
@@ -124,6 +136,7 @@ fn after<'a>(segments: &[&'a str], name: &str) -> Option<&'a str> {
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Track(id) => write!(f, "трек {id}"),
             Self::Album(AlbumId(id)) => write!(f, "альбом {id}"),
             Self::Playlist(PlaylistId { owner, kind }) => write!(f, "плейлист {owner}/{kind}"),
         }
@@ -162,18 +175,20 @@ mod tests {
         assert_eq!(parsed.ok(), Some(expected.to_owned()));
     }
 
-    /// Ссылка на трек разбирается не здесь: у неё своя команда, и молча качать
-    /// вместо трека весь альбом — не то, чего просили.
+    /// Ссылка на трек внутри альбома — это трек, а не альбом. Иначе одна
+    /// лишняя часть пути молча превращала бы загрузку трека в загрузку диска.
     #[rstest]
-    #[case::track_in_album("https://music.yandex.ru/album/4147089/track/33898323")]
-    #[case::track_alone("https://music.yandex.ru/track/33898323")]
-    fn rejects_track_link(#[case] input: &str) {
-        let message = Source::parse(input).err().map(|error| format!("{error:#}"));
-
-        assert!(
-            message.is_some_and(|message| message.contains("download-track")),
-            "отказ должен подсказывать команду для треков"
-        );
+    #[case::track_in_album(
+        "https://music.yandex.ru/album/4147089/track/33898323",
+        "трек 33898323"
+    )]
+    #[case::track_alone("https://music.yandex.ru/track/33898323", "трек 33898323")]
+    #[case::track_with_query("https://music.yandex.ru/track/42?utm_source=web", "трек 42")]
+    #[case::bare_id("33898323", "трек 33898323")]
+    #[case::bare_id_with_spaces("  33898323  ", "трек 33898323")]
+    fn parses_track_link(#[case] input: &str, #[case] expected: &str) {
+        let parsed = Source::parse(input).map(|source| source.to_string());
+        assert_eq!(parsed.ok(), Some(expected.to_owned()));
     }
 
     #[rstest]
@@ -183,7 +198,10 @@ mod tests {
     #[case::playlist_without_kind("https://music.yandex.ru/users/ivan/playlists/")]
     #[case::playlist_without_owner("https://music.yandex.ru/users//playlists/1")]
     #[case::playlist_kind_not_a_number("https://music.yandex.ru/users/ivan/playlists/abc")]
-    #[case::bare_id("4147089")]
+    // Номер альбома рядом с испорченным номером трека не должен вытянуть
+    // разбор в сторону альбома: сказано «трек» — значит трек.
+    #[case::track_not_a_number("https://music.yandex.ru/album/1/track/abc")]
+    #[case::track_without_id("https://music.yandex.ru/album/1/track/")]
     #[case::empty("")]
     // Владелец уезжает в путь запроса, поэтому пунктуация в нём — это попытка
     // увести запрос на другую ручку, а не необычный логин.

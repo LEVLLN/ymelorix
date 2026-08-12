@@ -1,7 +1,6 @@
 //! Плоское представление трека для вывода и скачивания.
 
 use core::fmt;
-use std::time::Duration;
 
 use anyhow::Context as _;
 use yandex_music::model::track::Track;
@@ -73,7 +72,6 @@ pub(crate) struct TrackInfo {
     id: TrackId,
     artists: Vec<String>,
     title: Option<String>,
-    duration: Option<Duration>,
 }
 
 impl TrackInfo {
@@ -155,7 +153,6 @@ impl From<&Track> for TrackInfo {
                 .filter_map(|artist| artist.name.clone())
                 .collect(),
             title: track.title.clone(),
-            duration: track.duration,
         }
     }
 }
@@ -168,24 +165,9 @@ impl fmt::Display for TrackInfo {
             id: _id,
             artists: _artists,
             title: _title,
-            duration,
         } = self;
 
-        let artists = self.artists();
-        let title = self.title();
-
-        match duration {
-            Some(duration) => {
-                let seconds = duration.as_secs();
-                write!(
-                    f,
-                    "{artists} — {title} [{}:{:02}]",
-                    seconds / 60,
-                    seconds % 60
-                )
-            }
-            None => write!(f, "{artists} — {title}"),
-        }
+        write!(f, "{} — {}", self.artists(), self.title())
     }
 }
 
@@ -193,14 +175,13 @@ impl fmt::Display for TrackInfo {
 mod tests {
     use rstest::rstest;
 
-    use super::{Duration, TrackId, TrackInfo};
+    use super::{TrackId, TrackInfo};
 
-    fn track(artists: &[&str], title: Option<&str>, seconds: Option<u64>) -> TrackInfo {
+    fn track(artists: &[&str], title: Option<&str>) -> TrackInfo {
         TrackInfo {
             id: TrackId("1".to_owned()),
             artists: artists.iter().map(|name| (*name).to_owned()).collect(),
             title: title.map(str::to_owned),
-            duration: seconds.map(Duration::from_secs),
         }
     }
 
@@ -209,53 +190,36 @@ mod tests {
             id: _generated,
             artists,
             title,
-            duration,
-        } = track(artists, title, None);
+        } = track(artists, title);
 
         TrackInfo {
             id: TrackId(id.to_owned()),
             artists,
             title,
-            duration,
         }
     }
 
     #[rstest]
-    #[case::full(
-        track(&["Radiohead"], Some("Weird Fishes"), Some(318)),
-        "Radiohead — Weird Fishes [5:18]"
-    )]
-    #[case::pads_seconds(
-        track(&["Boards of Canada"], Some("Olson"), Some(65)),
-        "Boards of Canada — Olson [1:05]"
-    )]
-    #[case::under_a_minute(
-        track(&["Aphex Twin"], Some("Ptolemy"), Some(9)),
-        "Aphex Twin — Ptolemy [0:09]"
-    )]
+    #[case::full(track(&["Radiohead"], Some("Weird Fishes")), "Radiohead — Weird Fishes")]
     #[case::several_artists(
-        track(&["Emika", "Michal Wolski"], Some("Cooler"), Some(120)),
-        "Emika, Michal Wolski — Cooler [2:00]"
+        track(&["Emika", "Michal Wolski"], Some("Cooler")),
+        "Emika, Michal Wolski — Cooler"
     )]
-    #[case::no_duration(track(&["Autechre"], Some("Gantz Graf"), None), "Autechre — Gantz Graf")]
-    #[case::no_artists(track(&[], Some("Untitled"), None), "<неизвестный исполнитель> — Untitled")]
-    #[case::no_title(track(&["Burial"], None, None), "Burial — <без названия>")]
-    #[case::nothing_known(track(&[], None, None), "<неизвестный исполнитель> — <без названия>")]
+    #[case::no_artists(track(&[], Some("Untitled")), "<неизвестный исполнитель> — Untitled")]
+    #[case::no_title(track(&["Burial"], None), "Burial — <без названия>")]
+    #[case::nothing_known(track(&[], None), "<неизвестный исполнитель> — <без названия>")]
     fn displays_track(#[case] track: TrackInfo, #[case] expected: &str) {
         assert_eq!(track.to_string(), expected);
     }
 
     #[rstest]
-    #[case::plain(track(&["Burial"], Some("Archangel"), Some(60)), "Burial - Archangel")]
+    #[case::plain(track(&["Burial"], Some("Archangel")), "Burial - Archangel")]
     #[case::several_artists(
-        track(&["Emika", "Michal Wolski"], Some("Cooler"), None),
+        track(&["Emika", "Michal Wolski"], Some("Cooler")),
         "Emika, Michal Wolski - Cooler"
     )]
-    #[case::strips_slashes(
-        track(&["AC/DC"], Some("Who Made Who?"), None),
-        "AC_DC - Who Made Who_"
-    )]
-    #[case::strips_control(track(&["A\nB"], Some("C\tD"), None), "A_B - C_D")]
+    #[case::strips_slashes(track(&["AC/DC"], Some("Who Made Who?")), "AC_DC - Who Made Who_")]
+    #[case::strips_control(track(&["A\nB"], Some("C\tD")), "A_B - C_D")]
     fn builds_file_stem(#[case] track: TrackInfo, #[case] expected: &str) {
         assert_eq!(track.file_stem(), expected);
     }
@@ -275,7 +239,7 @@ mod tests {
     #[case::emoji("🎧")]
     #[case::ascii("o")]
     fn keeps_file_stem_within_byte_budget(#[case] symbol: &str) {
-        let track = track(&["Разработчик"], Some(&symbol.repeat(500)), None);
+        let track = track(&["Разработчик"], Some(&symbol.repeat(500)));
 
         let stem = track.file_stem();
         assert!(
@@ -288,8 +252,11 @@ mod tests {
     /// Пустая строка от API — это отсутствие данных, а не имя: без этого
     /// файл назывался бы « - » и склеивал все такие треки в один.
     #[rstest]
-    #[case::blank_artist(track(&["   "], Some("Untitled"), None), "_неизвестный исполнитель_ - Untitled")]
-    #[case::blank_title(track(&["Burial"], Some("  "), None), "Burial - _без названия_")]
+    #[case::blank_artist(
+        track(&["   "], Some("Untitled")),
+        "_неизвестный исполнитель_ - Untitled"
+    )]
+    #[case::blank_title(track(&["Burial"], Some("  ")), "Burial - _без названия_")]
     fn treats_blank_values_from_api_as_missing(#[case] track: TrackInfo, #[case] expected: &str) {
         assert_eq!(track.file_stem(), expected);
     }
@@ -303,7 +270,7 @@ mod tests {
     #[case::windows_separator("..\\..\\windows")]
     #[case::dots("..")]
     fn file_stem_stays_a_single_path_component(#[case] title: &str) {
-        let stem = track(&["Кто-то"], Some(title), None).file_stem();
+        let stem = track(&["Кто-то"], Some(title)).file_stem();
 
         let path = std::path::Path::new("/базовая").join(&stem);
         assert_eq!(

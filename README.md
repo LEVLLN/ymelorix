@@ -26,7 +26,7 @@
 ```
 $ cargo run -- list-favorites
 Избранных треков: 342
-Radiohead — Weird Fishes / Arpeggi [5:18]
+Radiohead — Weird Fishes / Arpeggi
 ...
 ```
 
@@ -36,6 +36,19 @@ Radiohead — Weird Fishes / Arpeggi [5:18]
 
 ```sh
 cargo install --git https://github.com/LEVLLN/ymelorix
+```
+
+Собирается из исходников, поэтому кроме Rust нужны **компилятор C и CMake**: первый — чтобы
+вообще слинковать бинарь, второй — чтобы собрать `aws-lc-rs`, TLS-бэкенд из зависимостей
+`reqwest`. Без них сборка падает с ``error: linker `cc` not found`` ещё на скриптах сборки
+`proc-macro2` и `serde`.
+
+```sh
+sudo apt install build-essential cmake pkg-config   # Debian, Ubuntu
+sudo pacman -S --needed base-devel cmake            # Arch, Manjaro
+sudo dnf install gcc gcc-c++ cmake                  # Fedora, RHEL
+apk add build-base cmake                            # Alpine
+xcode-select --install && brew install cmake        # macOS
 ```
 
 ```sh
@@ -59,42 +72,44 @@ cargo run -- list-favorites
 | --- | --- |
 | `list-favorites` | Печатает все избранные треки |
 | `download-favorites [-p DIR] [-q QUALITY] [-u]` | Скачивает все избранные треки |
-| `download-track <URL> [-p DIR] [-q QUALITY] [-u]` | Скачивает трек по ссылке |
-| `download-link <URL> [-p DIR] [-q QUALITY] [-u]` | Скачивает альбом или плейлист по ссылке |
+| `download-link <URL> [-p DIR] [-q QUALITY] [-u]` | Скачивает трек, альбом или плейлист по ссылке |
 
 ```sh
 cargo run -- download-favorites --path ~/Music            # скачать весь список заново
 cargo run -- download-favorites --path ~/Music --update   # дозакачать недостающее
 cargo run -- download-favorites --path ~/Music -q normal  # с потерями, экономно
-cargo run -- download-track https://music.yandex.ru/album/4147089/track/33898323 -p ~/Music
+cargo run -- download-link https://music.yandex.ru/album/4147089/track/33898323 -p ~/Music
 cargo run -- download-link https://music.yandex.ru/album/4147089 -p ~/Music
 cargo run -- download-link https://music.yandex.ru/users/yamusic-daily/playlists/1234 -p ~/Music -u
 ```
 
-`--path` (`-p`), `--quality` (`-q`) и `--update` (`-u`) работают одинаково у всех трёх команд
+`--path` (`-p`), `--quality` (`-q`) и `--update` (`-u`) работают одинаково у обеих команд
 загрузки. `--path` — директория для файлов, создаётся при необходимости, по умолчанию текущая.
 
-Ссылку `download-track` понимает в любом виде: `album/<id>/track/<id>`, `track/<id>` или просто
-идентификатор трека.
+### Что понимает `download-link`
 
-### Альбом и плейлист
-
-`download-link` берёт ссылку двух видов — со схемой и без, с параметрами и якорем:
+Команда одна на всё, что адресуется ссылкой: вставляйте что есть, вид определяется сам.
+Ссылка принимается со схемой и без, с параметрами запроса и якорем.
 
 | Что | Ссылка |
 | --- | --- |
+| Трек | `https://music.yandex.ru/track/<id>`, `https://music.yandex.ru/album/<id>/track/<id>` или просто `<id>` |
 | Альбом | `https://music.yandex.ru/album/<id>` |
 | Плейлист | `https://music.yandex.ru/users/<владелец>/playlists/<номер>` |
 
-Владельцем в ссылке стоит логин (`yamusic-daily`) или числовой `uid` — годятся оба. Ссылку
-такого вида даёт кнопка «Поделиться» внутри плейлиста; короткая форма
-`music.yandex.ru/playlists/<uuid>` не поддерживается — ручке API нужны владелец и номер,
-а взять их из uuid неоткуда. Ссылка на трек тоже отвергается, с указанием на `download-track`:
-молча скачать альбом вместо трека — не то, чего просили.
+Голое число — это трек: у альбома и плейлиста голой формы нет, так что спутать их не с чем.
+Ссылка с частью `track/` разбирается только как трек, даже если рядом стоит номер альбома, —
+иначе испорченный номер трека молча превращался бы в загрузку целого диска.
 
-Треки альбома идут в порядке диска, треки плейлиста — в порядке плейлиста. Правила имён,
-пропусков и перезаписи те же, что у избранного; одноимённые треки внутри одной подборки так же
-делят имя файла.
+Владельцем плейлиста в ссылке стоит логин (`yamusic-daily`) или числовой `uid` — годятся оба.
+Ссылку такого вида даёт кнопка «Поделиться» внутри плейлиста; короткая форма
+`music.yandex.ru/playlists/<uuid>` не поддерживается — ручке API нужны владелец и номер,
+а взять их из uuid неоткуда.
+
+Треки альбома идут в порядке диска, треки плейлиста — в порядке плейлиста. Одиночный трек —
+тот же список, только из одного элемента: повторы, обработку `429` и пропуск по `--update` он
+получает ровно те же. Правила имён, пропусков и перезаписи общие с избранным; одноимённые треки
+внутри одной подборки так же делят имя файла.
 
 `--update` (`-u`) — **дозакачивание**. С этим флагом перед работой снимается список файлов
 в директории, и трек, который там уже есть, не качается заново. Без флага скачивается весь

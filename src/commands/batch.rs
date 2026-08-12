@@ -8,6 +8,18 @@ use std::collections::HashSet;
 
 use crate::{download, output, track::TrackInfo};
 
+/// Номер трека в списке — или пусто, если трек в списке один.
+///
+/// `[1/1]` перед единственной строкой ничего не сообщает: нумерация нужна,
+/// чтобы видеть, сколько осталось, а при одном треке считать нечего.
+fn position_prefix(position: usize, total: usize) -> String {
+    if total > 1 {
+        format!("[{position}/{total}] ")
+    } else {
+        String::new()
+    }
+}
+
 /// Сколько отказов подряд считать поломкой окружения, а не невезением.
 ///
 /// Отказ каждого следующего трека по одной и той же причине — истёкший токен,
@@ -59,7 +71,10 @@ pub(crate) async fn download_all(
                 } else {
                     ""
                 };
-                output::progress(&format!("[{position}/{total}] {track} — {outcome}{note}"));
+                output::progress(&format!(
+                    "{}{track} — {outcome}{note}",
+                    position_prefix(position, total)
+                ));
             }
             Err(download::Failure::Fatal(reason)) => {
                 return Err(reason.context(format!("выгрузка прервана на {position} из {total}")));
@@ -79,7 +94,8 @@ pub(crate) async fn download_all(
                 in_a_row += 1;
                 tracing::warn!(track = %track, error = format!("{reason:#}"), "трек не скачан");
                 output::progress(&format!(
-                    "[{position}/{total}] {track} — не скачан: {reason:#}"
+                    "{}{track} — не скачан: {reason:#}",
+                    position_prefix(position, total)
                 ));
 
                 if in_a_row >= GIVE_UP_AFTER {
@@ -97,4 +113,23 @@ pub(crate) async fn download_all(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::position_prefix;
+
+    #[rstest]
+    #[case::only_track(1, 1, "")]
+    #[case::first_of_many(1, 342, "[1/342] ")]
+    #[case::last_of_many(342, 342, "[342/342] ")]
+    fn numbers_the_list_only_when_there_is_something_to_count(
+        #[case] position: usize,
+        #[case] total: usize,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(position_prefix(position, total), expected);
+    }
 }
