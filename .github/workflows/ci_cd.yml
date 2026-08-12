@@ -1,0 +1,72 @@
+name: ci_cd
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Без `-- -D warnings`: строгость живёт в таблице `[lints]` манифеста,
+      # а не во флаге CI. `RUSTFLAGS` выше добивает то, что осталось от rustc.
+      - run: cargo clippy --all-targets
+
+  test:
+    name: test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.rust == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows нет намеренно: rustls тянет `aws-lc-sys`, а он на MSVC
+        # собирается только с NASM и CMake. Вернуть можно шагом установки
+        # NASM — но загрузчик живёт в cron на Unix, и платить за это чужим
+        # экшеном в CI не за что.
+        os: [ubuntu-latest, macos-latest]
+        # 1.91 — заявленный `rust-version`: ниже не собирается
+        # `Duration::from_mins`. Проверено, а не предположено.
+        rust: ["stable", "nightly", "1.91"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.rust }}
+      - run: cargo build --all-targets
+      - run: cargo test
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
