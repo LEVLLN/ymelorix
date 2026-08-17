@@ -17,6 +17,7 @@ mod library;
 mod net;
 mod output;
 mod source;
+mod tags;
 mod track;
 mod updater;
 

@@ -3,7 +3,12 @@
 use core::fmt;
 
 use anyhow::Context as _;
-use yandex_music::model::track::Track;
+use yandex_music::model::{
+    album::{Album, TrackPosition},
+    track::Track,
+};
+
+use crate::tags;
 
 const UNKNOWN_ARTIST: &str = "<неизвестный исполнитель>";
 const UNTITLED: &str = "<без названия>";
@@ -65,6 +70,27 @@ fn is_id(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|symbol| symbol.is_ascii_digit())
 }
 
+/// Место трека в альбоме: номер диска и номер на диске.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Position {
+    volume: u16,
+    index: u16,
+}
+
+/// Альбом, из которого взят трек, — всё, что нужно тегам.
+///
+/// Приезжает тем же ответом `get-tracks`, что и сам трек: за теги не платится
+/// ни одного лишнего запроса.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AlbumInfo {
+    title: Option<String>,
+    artists: Vec<String>,
+    year: Option<u16>,
+    genre: Option<String>,
+    position: Option<Position>,
+    tracks: Option<u16>,
+}
+
 /// Модель крейта дальше этого места не идёт: форматирование остаётся чистым
 /// и проверяется тестами без обращения к API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,11 +98,36 @@ pub(crate) struct TrackInfo {
     id: TrackId,
     artists: Vec<String>,
     title: Option<String>,
+    album: Option<AlbumInfo>,
 }
 
 impl TrackInfo {
     pub(crate) fn id(&self) -> &TrackId {
         &self.id
+    }
+
+    /// Что писать в теги файла.
+    ///
+    /// Заглушки `<неизвестный исполнитель>` и `<без названия>` сюда не едут:
+    /// в имени файла они полезны, а в теге плеер покажет их как настоящее имя.
+    pub(crate) fn tags(&self) -> tags::Meta {
+        let album = self.album.as_ref();
+
+        tags::Meta {
+            title: cleaned(self.title.as_deref()),
+            artists: owned(&self.artists),
+            album: album.and_then(|album| cleaned(album.title.as_deref())),
+            album_artists: album.map(|album| owned(&album.artists)).unwrap_or_default(),
+            year: album.and_then(|album| album.year),
+            genre: album.and_then(|album| cleaned(album.genre.as_deref())),
+            number: album.and_then(|album| {
+                album.position.map(|position| tags::Number {
+                    index: position.index,
+                    total: album.tracks,
+                })
+            }),
+            volume: album.and_then(|album| album.position.map(|position| position.volume)),
+        }
     }
 
     /// Имя файла без расширения: `исполнители - название`.
@@ -111,17 +162,9 @@ impl TrackInfo {
     /// Пустая строка от API — это отсутствие, а не имя: иначе трек без
     /// исполнителя получил бы файл, начинающийся с пробела и дефиса.
     fn artists(&self) -> String {
-        let named: Vec<&str> = self
-            .artists
-            .iter()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .collect();
-
-        if named.is_empty() {
-            UNKNOWN_ARTIST.to_owned()
-        } else {
-            named.join(", ")
+        match owned(&self.artists).as_slice() {
+            [] => UNKNOWN_ARTIST.to_owned(),
+            named => named.join(", "),
         }
     }
 
@@ -135,6 +178,24 @@ impl TrackInfo {
     }
 }
 
+/// Строка от API без краёв — или ничего, если после обрезки не осталось ничего.
+///
+/// Пустая строка от API — это отсутствие данных, а не значение.
+fn cleaned(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Имена без пустых и без краёв.
+fn owned(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter_map(|name| cleaned(Some(name)))
+        .collect()
+}
+
 /// Режет строку по пределу в байтах, не разваливая символ пополам.
 fn truncate_bytes(text: &str, limit: usize) -> String {
     text.char_indices()
@@ -143,18 +204,75 @@ fn truncate_bytes(text: &str, limit: usize) -> String {
         .collect()
 }
 
-impl From<&Track> for TrackInfo {
-    fn from(track: &Track) -> Self {
-        Self {
+/// Ответ Музыки не лёг в модель.
+///
+/// Числа, не помещающиеся в номер трека, — это не «редкий альбом», а мусор в
+/// ответе. Отбросить их молча — значит записать в тег правдоподобную неправду,
+/// поэтому конверсия падающая и живёт в [`TryFrom`], а не в [`From`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Malformed {
+    #[error("номер трека в альбоме не похож на номер: {0}")]
+    Position(u32),
+    #[error("число треков в альбоме не похоже на число: {0}")]
+    Count(u32),
+}
+
+impl TryFrom<&Track> for TrackInfo {
+    type Error = Malformed;
+
+    fn try_from(track: &Track) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: TrackId(track.id.clone()),
-            artists: track
-                .artists
-                .iter()
-                .filter_map(|artist| artist.name.clone())
-                .collect(),
+            artists: names(&track.artists),
             title: track.title.clone(),
-        }
+            // Альбомов у трека может быть несколько (сингл, сборник,
+            // переиздание); первый — тот, в контексте которого трек отдан.
+            album: track.albums.first().map(AlbumInfo::try_from).transpose()?,
+        })
     }
+}
+
+impl TryFrom<&Album> for AlbumInfo {
+    type Error = Malformed;
+
+    fn try_from(album: &Album) -> Result<Self, Self::Error> {
+        Ok(Self {
+            title: album.title.clone(),
+            artists: names(&album.artists),
+            year: album.year,
+            genre: album.genre.clone(),
+            position: album
+                .track_position
+                .as_ref()
+                .map(Position::try_from)
+                .transpose()?,
+            tracks: album
+                .track_count
+                .map(|count| u16::try_from(count).map_err(|_overflow| Malformed::Count(count)))
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<&TrackPosition> for Position {
+    type Error = Malformed;
+
+    fn try_from(position: &TrackPosition) -> Result<Self, Self::Error> {
+        // Разбор ради проверки на полноту: новое поле сломает компиляцию здесь.
+        let TrackPosition { volume, index } = position;
+
+        Ok(Self {
+            volume: u16::from(*volume),
+            index: u16::try_from(*index).map_err(|_overflow| Malformed::Position(*index))?,
+        })
+    }
+}
+
+fn names(artists: &[yandex_music::model::artist::Artist]) -> Vec<String> {
+    artists
+        .iter()
+        .filter_map(|artist| artist.name.clone())
+        .collect()
 }
 
 impl fmt::Display for TrackInfo {
@@ -165,6 +283,7 @@ impl fmt::Display for TrackInfo {
             id: _id,
             artists: _artists,
             title: _title,
+            album: _album,
         } = self;
 
         write!(f, "{} — {}", self.artists(), self.title())
@@ -175,13 +294,14 @@ impl fmt::Display for TrackInfo {
 mod tests {
     use rstest::rstest;
 
-    use super::{TrackId, TrackInfo};
+    use super::{AlbumInfo, Position, TrackId, TrackInfo};
 
     fn track(artists: &[&str], title: Option<&str>) -> TrackInfo {
         TrackInfo {
             id: TrackId("1".to_owned()),
             artists: artists.iter().map(|name| (*name).to_owned()).collect(),
             title: title.map(str::to_owned),
+            album: None,
         }
     }
 
@@ -190,12 +310,14 @@ mod tests {
             id: _generated,
             artists,
             title,
+            album,
         } = track(artists, title);
 
         TrackInfo {
             id: TrackId(id.to_owned()),
             artists,
             title,
+            album,
         }
     }
 
@@ -278,6 +400,50 @@ mod tests {
             Some(&*stem)
         );
         assert_eq!(path.parent(), Some(std::path::Path::new("/базовая")));
+    }
+
+    #[test]
+    fn carries_album_data_into_tags() {
+        let track = TrackInfo {
+            id: TrackId("1".to_owned()),
+            artists: vec!["Кремний".to_owned(), "  Тальк  ".to_owned()],
+            title: Some("  Обратный отсчёт  ".to_owned()),
+            album: Some(AlbumInfo {
+                title: Some("Ниже уровня моря".to_owned()),
+                artists: vec!["Кремний".to_owned()],
+                year: Some(2019),
+                genre: Some("rap".to_owned()),
+                position: Some(Position {
+                    volume: 1,
+                    index: 4,
+                }),
+                tracks: Some(11),
+            }),
+        };
+
+        let meta = track.tags();
+        assert_eq!(meta.title, Some("Обратный отсчёт".to_owned()));
+        assert_eq!(meta.artists, vec!["Кремний".to_owned(), "Тальк".to_owned()]);
+        assert_eq!(meta.album, Some("Ниже уровня моря".to_owned()));
+        assert_eq!(
+            meta.number,
+            Some(crate::tags::Number {
+                index: 4,
+                total: Some(11)
+            })
+        );
+        assert_eq!(meta.volume, Some(1));
+    }
+
+    /// Заглушки нужны имени файла, но не тегу: `<без названия>` в плеере
+    /// выглядит как настоящее название, а отсутствие поля — как отсутствие.
+    #[test]
+    fn keeps_placeholders_out_of_tags() {
+        let meta = track(&["   "], None).tags();
+
+        assert_eq!(meta.title, None);
+        assert!(meta.artists.is_empty());
+        assert_eq!(meta.number, None);
     }
 
     #[rstest]
