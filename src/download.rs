@@ -14,7 +14,7 @@ use yandex_music::{
     model::info::file_info::Quality as ApiQuality,
 };
 
-use crate::{net, track::TrackInfo, updater::Existing};
+use crate::{net, tags, track::TrackInfo, updater::Existing};
 
 /// Какого качества просить файл.
 ///
@@ -56,6 +56,14 @@ const PART_EXTENSION: &str = "part";
 
 /// Сколько раз просить у раздачи один и тот же файл, пока она отвечает `429`.
 const FILE_ATTEMPTS: u32 = 3;
+
+/// Потолок на начало файла, которое копится в памяти ради тегов.
+///
+/// Теги пишутся на лету: начало файла придерживается, пока не станет ясно, где
+/// кончается заголовок. У файлов Музыки `moov` идёт первым и занимает единицы
+/// килобайт, так что потолок режет только раскладку, при которой заголовок
+/// лежит **после** звука, — там придержать пришлось бы весь файл.
+const MAX_HEAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// Что произошло с треком: файл появился или уже лежал на месте.
 #[derive(Debug)]
@@ -157,12 +165,30 @@ pub(crate) async fn track(context: &Context<'_>, track: &TrackInfo) -> Result<Ou
         .directory
         .join(format!("{stem}.{extension}.{PART_EXTENSION}"));
 
+    // Данные для тегов приехали тем же ответом, что и сам трек: за них не
+    // платится ни одного лишнего запроса.
+    let meta = track.tags();
+    let format = tags::Format::of(extension);
+
     // Сначала во временный файл, потом переименование. `rename` в пределах
     // директории атомарен: оборванная загрузка не оставит правдоподобный
     // огрызок, который следующий запуск сочтёт скачанным и не тронет никогда.
     let mut last_error = None;
     for url in mirrors(&file_info.url, &file_info.urls) {
-        match fetch(context.http, &url, &temporary, file_info.size).await {
+        let transfer = Transfer {
+            http: context.http,
+            url: &url,
+            temporary: &temporary,
+            expected: file_info.size,
+            head: format.map(|format| Head {
+                format,
+                meta: &meta,
+                track,
+                buffer: Vec::new(),
+            }),
+        };
+
+        match fetch(transfer).await {
             Ok(bytes) => {
                 tokio::fs::rename(&temporary, &path)
                     .await
@@ -269,17 +295,94 @@ async fn open(http: &reqwest::Client, url: &str) -> Result<reqwest::Response, Fa
     }
 }
 
-/// Качает тело по ссылке во временный файл и возвращает его размер.
+/// Одна попытка выкачать файл: куда идти, куда класть и что дописать в теги.
+struct Transfer<'a> {
+    http: &'a reqwest::Client,
+    url: &'a str,
+    temporary: &'a Path,
+    expected: Option<u64>,
+    /// `None` — расширение незнакомое, теги не пишем и придерживать нечего.
+    head: Option<Head<'a>>,
+}
+
+/// Придержанное начало файла.
+///
+/// Теги дописываются на лету: пока не видно, где кончается заголовок, байты
+/// копятся здесь, а не уезжают на диск. Иначе пришлось бы после загрузки
+/// перекладывать весь файл целиком, чтобы вставить пару сотен байт в начало.
+struct Head<'a> {
+    format: tags::Format,
+    meta: &'a tags::Meta,
+    track: &'a TrackInfo,
+    buffer: Vec<u8>,
+}
+
+impl Head<'_> {
+    /// Принимает очередной кусок и, если решение созрело, отдаёт байты для записи.
+    ///
+    /// `None` — заголовка ещё не хватает, копим дальше.
+    fn feed(&mut self, chunk: &[u8]) -> Option<Vec<u8>> {
+        self.buffer.extend_from_slice(chunk);
+        self.decide(Ending::More)
+    }
+
+    /// Поток кончился, а решение так и не созрело: писать то, что есть.
+    fn settle(mut self) -> Vec<u8> {
+        match self.decide(Ending::Last) {
+            Some(bytes) => bytes,
+            None => self.buffer,
+        }
+    }
+
+    fn decide(&mut self, ending: Ending) -> Option<Vec<u8>> {
+        match tags::patch(self.format, &self.buffer, self.meta) {
+            tags::Patch::Ready { head, used } => {
+                let buffered = core::mem::take(&mut self.buffer);
+                Some([head.as_slice(), buffered.get(used..).unwrap_or_default()].concat())
+            }
+            tags::Patch::Refused(reason) => Some(self.untagged(reason)),
+            tags::Patch::More => match ending {
+                Ending::Last => Some(self.untagged(tags::Reason::Malformed)),
+                Ending::More if self.buffer.len() > MAX_HEAD_BYTES => {
+                    Some(self.untagged(tags::Reason::Oversized))
+                }
+                Ending::More => None,
+            },
+        }
+    }
+
+    /// Теги не записаны — но файл записан.
+    ///
+    /// Осознанная деградация: трек без тегов лучше отсутствующего трека.
+    /// Молчать о ней нельзя, иначе разница между «формат не тот» и «разборщик
+    /// сломался» видна только по свойствам файла в плеере.
+    fn untagged(&mut self, reason: tags::Reason) -> Vec<u8> {
+        tracing::warn!(track = %self.track, %reason, "теги не записаны");
+        core::mem::take(&mut self.buffer)
+    }
+}
+
+/// Кончился ли поток — от этого зависит, ждать ли ещё байт.
+#[derive(Debug, Clone, Copy)]
+enum Ending {
+    More,
+    Last,
+}
+
+/// Качает тело по ссылке во временный файл и возвращает размер записанного.
 ///
 /// Тело пишется потоком, а не буферизуется целиком: размер выбирает сервер.
-async fn fetch(
-    http: &reqwest::Client,
-    url: &str,
-    temporary: &Path,
-    expected: Option<u64>,
-) -> Result<u64, Failure> {
-    let mut response = open(http, url).await?;
+/// Исключение — начало файла, которое придерживается ради тегов.
+async fn fetch(transfer: Transfer<'_>) -> Result<u64, Failure> {
+    let Transfer {
+        http,
+        url,
+        temporary,
+        expected,
+        mut head,
+    } = transfer;
 
+    let mut response = open(http, url).await?;
     let mut file = tokio::fs::File::create(temporary).await.map_err(|error| {
         from_io(
             error,
@@ -287,6 +390,7 @@ async fn fetch(
         )
     })?;
 
+    let mut received = 0_u64;
     let mut written = 0_u64;
     loop {
         let chunk = response
@@ -297,29 +401,39 @@ async fn fetch(
             .map_err(Failure::Track)?;
         let Some(chunk) = chunk else { break };
 
-        written = written.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        if written > MAX_TRACK_BYTES {
+        received = received.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if received > MAX_TRACK_BYTES {
             return Err(Failure::Track(anyhow!(
                 "файл больше {} МБ — это не похоже на трек",
                 MAX_TRACK_BYTES / 1024 / 1024
             )));
         }
 
-        file.write_all(&chunk).await.map_err(|error| {
-            from_io(
-                error,
-                &format!("не удалось записать {}", temporary.display()),
-            )
-        })?;
+        match head.as_mut() {
+            None => written = written.saturating_add(put(&mut file, &chunk, temporary).await?),
+            Some(pending) => {
+                if let Some(bytes) = pending.feed(&chunk) {
+                    head = None;
+                    written = written.saturating_add(put(&mut file, &bytes, temporary).await?);
+                }
+            }
+        }
+    }
+
+    if let Some(pending) = head {
+        let bytes = pending.settle();
+        written = written.saturating_add(put(&mut file, &bytes, temporary).await?);
     }
 
     // Сверка с обещанным размером ловит и обрыв, и CDN, вернувший страницу
     // с ошибкой под видом успеха, — иначе HTML лёг бы на диск как `.flac`.
+    // Сверяется именно принятое: на диске лежит ещё и тег, которого в обещанном
+    // размере нет.
     if let Some(expected) = expected
-        && expected != written
+        && expected != received
     {
         return Err(Failure::Track(anyhow!(
-            "файл пришёл не целиком: {written} байт вместо {expected}"
+            "файл пришёл не целиком: {received} байт вместо {expected}"
         )));
     }
 
@@ -334,6 +448,18 @@ async fn fetch(
     })?;
 
     Ok(written)
+}
+
+/// Пишет кусок и возвращает, сколько байт легло на диск.
+async fn put(file: &mut tokio::fs::File, bytes: &[u8], temporary: &Path) -> Result<u64, Failure> {
+    file.write_all(bytes).await.map_err(|error| {
+        from_io(
+            error,
+            &format!("не удалось записать {}", temporary.display()),
+        )
+    })?;
+
+    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
 }
 
 /// Убирает остаток неудавшейся попытки.

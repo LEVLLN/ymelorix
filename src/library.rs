@@ -85,8 +85,9 @@ pub(crate) async fn album_tracks(
         .volumes
         .iter()
         .flatten()
-        .map(TrackInfo::from)
-        .collect();
+        .map(TrackInfo::try_from)
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("альбом {} отдан в неожиданном виде", album.value()))?;
     if tracks.is_empty() {
         bail!("в альбоме {} нет треков", album.value());
     }
@@ -192,7 +193,12 @@ async fn tracks_by_ids(
             .with_context(|| format!("не удалось получить данные {} треков", chunk.len()))
         })
         .await?;
-        tracks.extend(batch.iter().map(TrackInfo::from));
+        for track in &batch {
+            tracks.push(
+                TrackInfo::try_from(track)
+                    .with_context(|| format!("трек {} отдан в неожиданном виде", track.id))?,
+            );
+        }
     }
 
     Ok(tracks)
@@ -259,6 +265,7 @@ pub(crate) async fn track_by_id(
 
     match tracks.as_slice() {
         [] => bail!("трек {id} не найден"),
-        [track, ..] => Ok(TrackInfo::from(track)),
+        [track, ..] => TrackInfo::try_from(track)
+            .with_context(|| format!("трек {id} отдан в неожиданном виде")),
     }
 }
