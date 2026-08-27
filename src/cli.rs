@@ -59,7 +59,7 @@ pub(crate) struct Target {
     #[arg(short, long, value_name = "DIR", default_value = ".")]
     pub(crate) path: PathBuf,
 
-    /// Качество: lossless, normal или low
+    /// Качество: lossless, high, normal или low
     #[arg(short, long, value_name = "QUALITY", default_value = "lossless")]
     pub(crate) quality: Quality,
 
@@ -89,7 +89,7 @@ impl Target {
 /// знание о clap не должно спускаться туда — слой разбора аргументов здесь.
 impl ValueEnum for Quality {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Lossless, Self::Normal, Self::Low]
+        &[Self::Lossless, Self::High, Self::Normal, Self::Low]
     }
 
     fn to_possible_value(&self) -> Option<PossibleValue> {
@@ -97,6 +97,7 @@ impl ValueEnum for Quality {
             Self::Lossless => {
                 PossibleValue::new("lossless").help("без потерь, FLAC — самые большие файлы")
             }
+            Self::High => PossibleValue::new("high").help("высокое, MP3 320 kbps"),
             Self::Normal => PossibleValue::new("normal").help("обычное, экономит трафик и место"),
             Self::Low => PossibleValue::new("low").help("низкое, для медленной связи"),
         })
@@ -110,6 +111,7 @@ impl ValueEnum for Quality {
 )]
 mod tests {
     use clap::Parser as _;
+    use rstest::rstest;
 
     use super::{Cli, Command, Mode, Quality, Target};
 
@@ -134,6 +136,20 @@ mod tests {
             (target.quality, target.destination().mode),
             (Quality::Lossless, Mode::Full)
         );
+    }
+
+    /// Имена уровней — часть договорённости с пользователем, и `high` от
+    /// `normal` отличается только на проводе: перепутать их местами разбор не
+    /// должен.
+    #[rstest]
+    #[case::lossless("lossless", Quality::Lossless)]
+    #[case::high("high", Quality::High)]
+    #[case::normal("normal", Quality::Normal)]
+    #[case::low("low", Quality::Low)]
+    fn reads_every_quality(#[case] argument: &str, #[case] expected: Quality) {
+        let target = target_of(&["ymelorix", "download-favorites", "-q", argument]).unwrap();
+
+        assert_eq!(target.quality, expected);
     }
 
     #[test]

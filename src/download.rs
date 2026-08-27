@@ -10,8 +10,9 @@ use std::{
 use anyhow::{Context as _, anyhow};
 use tokio::io::AsyncWriteExt as _;
 use yandex_music::{
-    YandexMusicClient, api::track::get_file_info::GetFileInfoOptions,
-    model::info::file_info::Quality as ApiQuality,
+    YandexMusicClient,
+    api::track::get_file_info::GetFileInfoOptions,
+    model::info::file_info::{Codec, Quality as ApiQuality},
 };
 
 use crate::{net, tags, track::TrackInfo, updater::Existing};
@@ -19,12 +20,13 @@ use crate::{net, tags, track::TrackInfo, updater::Existing};
 /// Какого качества просить файл.
 ///
 /// Своя копия крейтового `Quality`: чужой тип не должен ходить по коду и не
-/// может быть аргументом командной строки. Кодек при этом не выбирается — из
-/// всех поддерживаемых его подбирает сервер под запрошенное качество.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Quality {
     /// Без потерь: FLAC, самые большие файлы.
     Lossless,
+    /// Высокое: MP3 320 kbps, максимум из того, что с потерями. На проводе —
+    /// верхний уровень с единственным кодеком `mp3`.
+    High,
     /// Обычное: сжатие с потерями, экономит трафик и место.
     Normal,
     /// Низкое: для медленной связи.
@@ -34,10 +36,25 @@ pub(crate) enum Quality {
 impl From<Quality> for ApiQuality {
     fn from(quality: Quality) -> Self {
         match quality {
-            Quality::Lossless => Self::Lossless,
+            // `lossless` на проводе значит «лучшее, что есть», а не «FLAC»:
+            // сузить его до одного `mp3` — и приедет максимальный mp3, то есть
+            // 320 kbps. `High` и `Lossless` разводит список кодеков, а не
+            // уровень. На `nq` тот же `mp3` отдаётся вдвое хуже — 192 kbps.
+            Quality::Lossless | Quality::High => Self::Lossless,
             Quality::Normal => Self::Normal,
             Quality::Low => Self::Low,
         }
+    }
+}
+
+fn file_request(track_id: &str, quality: Quality) -> GetFileInfoOptions {
+    let options = GetFileInfoOptions::new(track_id).quality(quality.into());
+
+    match quality {
+        // Тот же уровень, что у `Lossless`, но одним кодеком: сервер отдаёт
+        // лучший доступный `mp3`.
+        Quality::High => options.codecs([Codec::Mp3]),
+        Quality::Lossless | Quality::Normal | Quality::Low => options,
     }
 }
 
@@ -150,14 +167,21 @@ pub(crate) async fn track(context: &Context<'_>, track: &TrackInfo) -> Result<Ou
 
     let file_info = net::within_deadline(
         &format!("ссылка на файл трека {}", track.id()),
-        context.client.get_file_info(
-            &GetFileInfoOptions::new(track.id().as_str()).quality(context.quality.into()),
-        ),
+        context
+            .client
+            .get_file_info(&file_request(track.id().as_str(), context.quality)),
     )
     .await
     .map_err(Failure::Track)?
     .with_context(|| format!("нет ссылки на файл трека {}", track.id()))
     .map_err(Failure::Track)?;
+
+    tracing::debug!(
+        track = %track,
+        codec = %file_info.codec,
+        bitrate = file_info.bitrate,
+        "Музыка отдала файл"
+    );
 
     let extension = extension(&file_info.codec);
     let path = context.directory.join(format!("{stem}.{extension}"));
@@ -524,7 +548,10 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::{ApiQuality, Outcome, Quality, extension, is_environment_failure, mirrors};
+    use super::{
+        ApiQuality, Codec, Outcome, Quality, extension, file_request, is_environment_failure,
+        mirrors,
+    };
 
     /// Пропуск не касается сети, и обнулять им счётчик отказов подряд нельзя:
     /// на почти полной директории чередование «отказ — пропуск» иначе гасит
@@ -543,10 +570,23 @@ mod tests {
     /// имена вариантов: `nq` и `lq` со стороны не угадываются.
     #[rstest]
     #[case::lossless(Quality::Lossless, "lossless")]
+    #[case::high(Quality::High, "lossless")]
     #[case::normal(Quality::Normal, "nq")]
     #[case::low(Quality::Low, "lq")]
     fn maps_quality_to_wire_value(#[case] quality: Quality, #[case] expected: &str) {
         assert_eq!(ApiQuality::from(quality).to_string(), expected);
+    }
+
+    /// `High` отличается от `Lossless` только списком кодеков: уровней качества
+    /// у API три, а 320 kbps Музыка отдаёт лишь в `mp3`, и только на верхнем
+    /// уровне. Остальные качества список не сужают — кодек подбирает сервер.
+    #[rstest]
+    #[case::lossless(Quality::Lossless, Codec::all().to_vec())]
+    #[case::normal(Quality::Normal, Codec::all().to_vec())]
+    #[case::low(Quality::Low, Codec::all().to_vec())]
+    #[case::high(Quality::High, vec![Codec::Mp3])]
+    fn asks_only_mp3_for_high(#[case] quality: Quality, #[case] expected: Vec<Codec>) {
+        assert_eq!(file_request("33898323", quality).codecs, expected);
     }
 
     #[rstest]

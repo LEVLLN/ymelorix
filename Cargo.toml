@@ -1,6 +1,6 @@
 [package]
 name = "ymelorix"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Проверено на toolchain, а не выведено на глаз: на 1.90 не собирается
 # `Duration::from_mins`. Тот же номер стоит в матрице CI.
