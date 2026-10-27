@@ -1,6 +1,7 @@
 //! Плоское представление трека для вывода и скачивания.
 
 use core::fmt;
+use std::path::PathBuf;
 
 use anyhow::Context as _;
 use yandex_music::model::{
@@ -23,6 +24,15 @@ const FORBIDDEN_IN_NAME: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '
 /// символов названия могли бы дать четыреста байт и `ENAMETOOLONG`. Остаток
 /// бюджета уходит на расширение и суффикс незавершённой загрузки: `.flac.part`.
 const MAX_NAME_BYTES: usize = 150;
+
+/// Как раскладывать файлы внутри директории назначения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layout {
+    /// Все файлы рядом: `Исполнители - Название`.
+    Flatten,
+    /// Поддиректории `Исполнители/Альбом/Название`.
+    Structured,
+}
 
 /// Идентификатор трека в Музыке.
 ///
@@ -130,6 +140,26 @@ impl TrackInfo {
         }
     }
 
+    /// Относительный путь без расширения; плоская раскладка сохраняет прежнее имя.
+    pub(crate) fn relative_stem(&self, layout: Layout) -> PathBuf {
+        match layout {
+            Layout::Flatten => PathBuf::from(self.file_stem()),
+            Layout::Structured => {
+                let album = self
+                    .album
+                    .as_ref()
+                    .and_then(|album| album.title.as_deref())
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or("<без альбома>");
+
+                PathBuf::from(sanitize_component(&self.artists()))
+                    .join(sanitize_component(album))
+                    .join(sanitize_component(self.title()))
+            }
+        }
+    }
+
     /// Имя файла без расширения: `исполнители - название`.
     ///
     /// Идентификатора в имени намеренно нет — имя должно оставаться читаемым.
@@ -141,20 +171,7 @@ impl TrackInfo {
     /// Запрещённые символы заменяются на `_`, длина ограничена по байтам —
     /// иначе трек с длинным названием не запишется на диск.
     pub(crate) fn file_stem(&self) -> String {
-        let name: String = format!("{} - {}", self.artists(), self.title())
-            .chars()
-            .map(|symbol| {
-                if FORBIDDEN_IN_NAME.contains(&symbol) || symbol.is_control() {
-                    '_'
-                } else {
-                    symbol
-                }
-            })
-            .collect();
-
-        // `trim_end` после обрезки: срез по байтовому пределу легко приходится
-        // на пробел, а имя файла с хвостовым пробелом — источник сюрпризов.
-        truncate_bytes(&name, MAX_NAME_BYTES).trim_end().to_owned()
+        sanitize_component(&format!("{} - {}", self.artists(), self.title()))
     }
 
     /// Исполнители одной строкой.
@@ -175,6 +192,27 @@ impl TrackInfo {
             .map(str::trim)
             .filter(|title| !title.is_empty())
             .unwrap_or(UNTITLED)
+    }
+}
+
+/// Очищает один компонент, не разрезая UTF-8 на байтовом пределе.
+fn sanitize_component(raw: &str) -> String {
+    let name: String = raw
+        .chars()
+        .map(|symbol| {
+            if FORBIDDEN_IN_NAME.contains(&symbol) || symbol.is_control() {
+                '_'
+            } else {
+                symbol
+            }
+        })
+        .collect();
+
+    // Обрезка может прийтись на пробел — убираем хвост уже после неё.
+    let truncated = truncate_bytes(&name, MAX_NAME_BYTES);
+    match truncated.trim_end() {
+        "" | "." | ".." => "_".to_owned(),
+        component => component.to_owned(),
     }
 }
 
@@ -305,6 +343,17 @@ mod tests {
         }
     }
 
+    fn album(title: Option<&str>) -> AlbumInfo {
+        AlbumInfo {
+            title: title.map(str::to_owned),
+            artists: Vec::new(),
+            year: None,
+            genre: None,
+            position: None,
+            tracks: None,
+        }
+    }
+
     fn with_id(id: &str, artists: &[&str], title: Option<&str>) -> TrackInfo {
         let TrackInfo {
             id: _generated,
@@ -344,6 +393,100 @@ mod tests {
     #[case::strips_control(track(&["A\nB"], Some("C\tD")), "A_B - C_D")]
     fn builds_file_stem(#[case] track: TrackInfo, #[case] expected: &str) {
         assert_eq!(track.file_stem(), expected);
+    }
+
+    #[test]
+    fn test_structured_layout_uses_artists_album_and_title() {
+        let item = TrackInfo {
+            id: TrackId("1".to_owned()),
+            artists: vec!["Burial".to_owned(), "Four Tet".to_owned()],
+            title: Some("  Moth.live  ".to_owned()),
+            album: Some(AlbumInfo {
+                title: Some("  Moth / Wolf Cub  ".to_owned()),
+                artists: vec!["Burial".to_owned()],
+                year: None,
+                genre: None,
+                position: None,
+                tracks: None,
+            }),
+        };
+
+        assert_eq!(
+            item.relative_stem(crate::track::Layout::Structured),
+            std::path::Path::new("Burial, Four Tet")
+                .join("Moth _ Wolf Cub")
+                .join("Moth.live")
+        );
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::blank("   ")]
+    #[case::current(".")]
+    #[case::parent("..")]
+    #[case::trailing_spaces("..   ")]
+    #[case::after_truncation(&format!(".{}X", " ".repeat(150)))]
+    fn test_neutralizes_special_path_components(#[case] raw: &str) {
+        assert_eq!(crate::track::sanitize_component(raw), "_");
+    }
+
+    #[rstest]
+    #[case::plain(track(&["Burial"], Some("Archangel")))]
+    #[case::slashes(track(&["AC/DC"], Some("Who Made Who?")))]
+    #[case::dots(track(&["A.B"], Some("Live.mp3")))]
+    #[case::missing(track(&[], None))]
+    #[case::long(track(&["о".repeat(200).as_str()], Some(&"🎧".repeat(200))))]
+    fn test_flatten_keeps_the_old_file_name(#[case] item: TrackInfo) {
+        assert_eq!(
+            item.relative_stem(crate::track::Layout::Flatten),
+            std::path::PathBuf::from(item.file_stem())
+        );
+    }
+
+    #[rstest]
+    #[case::missing(None)]
+    #[case::no_title(Some(album(None)))]
+    #[case::blank(Some(album(Some("   "))))]
+    fn test_structured_uses_placeholders_for_missing_metadata(#[case] album: Option<AlbumInfo>) {
+        let item = TrackInfo {
+            id: TrackId("1".to_owned()),
+            artists: Vec::new(),
+            title: None,
+            album,
+        };
+
+        assert_eq!(
+            item.relative_stem(crate::track::Layout::Structured),
+            std::path::Path::new("_неизвестный исполнитель_")
+                .join("_без альбома_")
+                .join("_без названия_")
+        );
+    }
+
+    #[rstest]
+    #[case::parent("..")]
+    #[case::current(".")]
+    #[case::traversal("../../etc")]
+    #[case::absolute("/etc/passwd")]
+    #[case::windows("C:\\Music\\track")]
+    #[case::control("A\nB\0C")]
+    #[case::unicode(&"🎧".repeat(200))]
+    fn test_structured_components_are_normal_and_bounded(#[case] raw: &str) {
+        let mut item = track(&[raw], Some(raw));
+        item.album = Some(AlbumInfo {
+            title: Some(raw.to_owned()),
+            artists: Vec::new(),
+            year: None,
+            genre: None,
+            position: None,
+            tracks: None,
+        });
+        let path = item.relative_stem(crate::track::Layout::Structured);
+        let components: Vec<_> = path.components().collect();
+
+        assert!(matches!(components.as_slice(), [artist, album, title]
+            if [artist, album, title].into_iter().all(|component|
+                matches!(component, std::path::Component::Normal(name) if name.len() <= crate::track::MAX_NAME_BYTES))));
     }
 
     /// Решение принято сознательно: читаемое имя важнее развода одноимённых

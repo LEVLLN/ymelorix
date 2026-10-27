@@ -59,6 +59,7 @@ pub(crate) async fn run(
         directory: destination.directory,
         existing: existing.as_ref(),
         quality,
+        layout: destination.layout,
     };
 
     batch::download_all(&context, &tracks).await

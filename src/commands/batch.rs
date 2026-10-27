@@ -64,14 +64,14 @@ pub(crate) async fn download_all(
                     // скачанных. Их число уходит в одну строку в конце.
                     download::Outcome::Skipped { stem: _stem } => skipped += 1,
                     download::Outcome::Downloaded {
-                        path: _path,
+                        path,
                         bytes: _bytes,
                     } => {
-                        let overwritten = !written.insert(track.file_stem());
+                        let overwritten = !written.insert(path.clone());
                         if overwritten {
                             tracing::warn!(
                                 track = %track,
-                                stem = track.file_stem(),
+                                path = %path.display(),
                                 "перезаписан файл одноимённого трека"
                             );
                         }

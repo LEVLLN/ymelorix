@@ -8,9 +8,15 @@
 //! файл, записанный в этом же прогоне, в снимок не попал — одноимённый трек его
 //! перезапишет, а не будет молча пропущен.
 
-use std::{collections::HashSet, ffi::OsStr, path::Path};
+use std::{
+    collections::HashSet,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context as _;
+
+use crate::track::Layout;
 
 /// Что делать с треком, который уже лежит в директории.
 ///
@@ -30,6 +36,7 @@ pub(crate) enum Mode {
 pub(crate) struct Destination<'a> {
     pub(crate) directory: &'a Path,
     pub(crate) mode: Mode,
+    pub(crate) layout: Layout,
 }
 
 impl Destination<'_> {
@@ -51,7 +58,7 @@ impl Destination<'_> {
 
         match self.mode {
             Mode::Full => Ok(None),
-            Mode::Update => Existing::read(self.directory).await.map(Some),
+            Mode::Update => Existing::read(self.directory, self.layout).await.map(Some),
         }
     }
 }
@@ -60,57 +67,68 @@ impl Destination<'_> {
 #[derive(Debug)]
 pub(crate) struct Existing {
     /// Имена файлов как есть — то, что видно в директории.
-    names: HashSet<String>,
+    names: HashSet<PathBuf>,
     /// Они же без расширения. Расширение до ответа API неизвестно, поэтому
     /// сверяться приходится по основе имени.
-    stems: HashSet<String>,
+    stems: HashSet<PathBuf>,
 }
 
 impl Existing {
-    /// Читает директорию целиком, один раз.
+    /// Читает снимок один раз; для structured спускается только до альбомов.
     ///
     /// # Errors
     ///
     /// Ошибка, если директорию не открыть или не перечислить.
-    pub(crate) async fn read(directory: &Path) -> anyhow::Result<Self> {
-        let mut entries = tokio::fs::read_dir(directory)
-            .await
-            .with_context(|| format!("не удалось прочитать директорию {}", directory.display()))?;
-
+    pub(crate) async fn read(directory: &Path, layout: Layout) -> anyhow::Result<Self> {
+        let max_depth = match layout {
+            Layout::Flatten => 0,
+            Layout::Structured => 2,
+        };
+        let mut pending = vec![PathBuf::new()];
         let mut names = Vec::new();
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .with_context(|| format!("не удалось перечислить директорию {}", directory.display()))?
-        {
-            names.push(entry.file_name());
+        while let Some(prefix) = pending.pop() {
+            let current = directory.join(&prefix);
+            let mut entries = tokio::fs::read_dir(&current).await.with_context(|| {
+                format!("не удалось прочитать директорию {}", current.display())
+            })?;
+            while let Some(entry) = entries.next_entry().await.with_context(|| {
+                format!("не удалось перечислить директорию {}", current.display())
+            })? {
+                // Не идём по симлинкам: ни циклы, ни чужое дерево в снимок не нужны.
+                let kind = entry.file_type().await.with_context(|| {
+                    format!("не удалось определить тип {}", entry.path().display())
+                })?;
+                let relative = prefix.join(entry.file_name());
+                if kind.is_file() {
+                    names.push(relative);
+                } else if kind.is_dir() && prefix.components().count() < max_depth {
+                    pending.push(relative);
+                }
+            }
         }
 
-        Ok(Self::from_names(
-            names.iter().filter_map(|name| name.to_str()),
-        ))
+        Ok(Self::from_names(names))
     }
 
     /// Имена файлов, найденных в директории.
-    pub(crate) fn names(&self) -> &HashSet<String> {
+    pub(crate) fn names(&self) -> &HashSet<PathBuf> {
         &self.names
     }
 
     /// Есть ли файл с такой основой имени — при любом расширении.
-    pub(crate) fn contains_stem(&self, stem: &str) -> bool {
-        self.stems.contains(stem)
+    pub(crate) fn contains_stem(&self, stem: impl AsRef<Path>) -> bool {
+        self.stems.contains(stem.as_ref())
     }
 
-    fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
-        let names: HashSet<String> = names.into_iter().map(str::to_owned).collect();
+    fn from_names(names: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
+        let names: HashSet<PathBuf> = names
+            .into_iter()
+            .map(|name| name.as_ref().to_owned())
+            .collect();
         let stems = names
             .iter()
-            .filter_map(|name| {
-                Path::new(name)
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .map(str::to_owned)
-            })
+            .filter(|name| name.extension() != Some(OsStr::new("part")))
+            .filter_map(|name| name.file_stem().map(|stem| name.with_file_name(stem)))
             .collect();
 
         Self { names, stems }
@@ -122,6 +140,20 @@ mod tests {
     use super::Existing;
 
     #[test]
+    fn test_indexes_relative_stem_without_losing_directories_or_dots() {
+        let existing = Existing::from_names(["Burial/Untrue/Archangel.live.flac"]);
+
+        assert!(existing.contains_stem("Burial/Untrue/Archangel.live"));
+    }
+
+    #[test]
+    fn test_partial_file_does_not_match_a_title_ending_in_a_codec() {
+        let existing = Existing::from_names(["Burial/Untrue/Archangel.mp3.part"]);
+
+        assert!(!existing.contains_stem("Burial/Untrue/Archangel.mp3"));
+    }
+
+    #[test]
     fn indexes_existing_files_by_stem() {
         let existing = Existing::from_names(["Burial - Archangel.flac", "заметка.txt"]);
 
@@ -131,10 +163,14 @@ mod tests {
     }
 
     #[test]
-    fn keeps_file_names_as_they_are() {
+    fn test_keeps_file_names_as_they_are() {
         let existing = Existing::from_names(["Burial - Archangel.flac"]);
 
-        assert!(existing.names().contains("Burial - Archangel.flac"));
+        assert!(
+            existing
+                .names()
+                .contains(std::path::Path::new("Burial - Archangel.flac"))
+        );
         assert_eq!(existing.names().len(), 1);
     }
 

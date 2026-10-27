@@ -15,7 +15,11 @@ use yandex_music::{
     model::info::file_info::{Codec, Quality as ApiQuality},
 };
 
-use crate::{net, tags, track::TrackInfo, updater::Existing};
+use crate::{
+    net, tags,
+    track::{Layout, TrackInfo},
+    updater::Existing,
+};
 
 /// Какого качества просить файл.
 ///
@@ -148,6 +152,7 @@ pub(crate) struct Context<'a> {
     /// весь список подряд.
     pub(crate) existing: Option<&'a Existing>,
     pub(crate) quality: Quality,
+    pub(crate) layout: Layout,
 }
 
 /// Кладёт трек в директорию, повторно не перекачивает.
@@ -157,13 +162,19 @@ pub(crate) struct Context<'a> {
 /// [`Failure::Track`], если Музыка не дала ссылку или файл не скачался;
 /// [`Failure::Fatal`], если отказала сама директория назначения.
 pub(crate) async fn track(context: &Context<'_>, track: &TrackInfo) -> Result<Outcome, Failure> {
-    let stem = track.file_stem();
+    let stem = track.relative_stem(context.layout);
     if context
         .existing
         .is_some_and(|existing| existing.contains_stem(&stem))
     {
-        return Ok(Outcome::Skipped { stem });
+        return Ok(Outcome::Skipped {
+            stem: stem.display().to_string(),
+        });
     }
+
+    prepare_parent(context.directory, &stem)
+        .await
+        .map_err(Failure::Fatal)?;
 
     let file_info = net::within_deadline(
         &format!("ссылка на файл трека {}", track.id()),
@@ -184,10 +195,13 @@ pub(crate) async fn track(context: &Context<'_>, track: &TrackInfo) -> Result<Ou
     );
 
     let extension = extension(&file_info.codec);
-    let path = context.directory.join(format!("{stem}.{extension}"));
-    let temporary = context
-        .directory
-        .join(format!("{stem}.{extension}.{PART_EXTENSION}"));
+    // Расширение дописывается, а не заменяется: точка может быть частью названия.
+    let mut path = context.directory.join(&stem);
+    path.as_mut_os_string().push(format!(".{extension}"));
+    let mut temporary = path.clone();
+    temporary
+        .as_mut_os_string()
+        .push(format!(".{PART_EXTENSION}"));
 
     // Данные для тегов приехали тем же ответом, что и сам трек: за них не
     // платится ни одного лишнего запроса.
@@ -245,6 +259,37 @@ pub(crate) async fn track(context: &Context<'_>, track: &TrackInfo) -> Result<Ou
             track.id()
         )
     })))
+}
+
+/// Создаёт поддиректории, не проходя по существующим симлинкам.
+///
+/// Базовую директорию выбирает пользователь, компоненты ниже неё — метаданные API.
+/// Дерево назначения должно быть недоступно для конкурентной подмены посторонними.
+async fn prepare_parent(base: &Path, stem: &Path) -> anyhow::Result<()> {
+    let Some(parent) = stem.parent() else {
+        return Ok(());
+    };
+    let mut directory = base.to_owned();
+    for component in parent {
+        directory.push(component);
+        if let Err(error) = tokio::fs::create_dir(&directory).await
+            && error.kind() != ErrorKind::AlreadyExists
+        {
+            return Err(anyhow::Error::new(error).context(format!(
+                "не удалось создать директорию {}",
+                directory.display()
+            )));
+        }
+        let metadata = tokio::fs::symlink_metadata(&directory)
+            .await
+            .with_context(|| format!("не удалось проверить директорию {}", directory.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "ожидалась директория, а не файл или симлинк: {}",
+            directory.display()
+        );
+    }
+    Ok(())
 }
 
 /// Куда идти за файлом: основная ссылка, затем зеркала.

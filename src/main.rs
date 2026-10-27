@@ -21,6 +21,12 @@ mod tags;
 mod track;
 mod updater;
 
+// У бинарного крейта нет lib-цели: файловые тесты подключаются здесь,
+// не расширяя видимость рабочего API ради тестового стенда.
+#[cfg(test)]
+#[path = "../tests/files/mod.rs"]
+mod files_tests;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Разбор аргументов раньше всего: `--help` и `--version` не должны требовать токен.

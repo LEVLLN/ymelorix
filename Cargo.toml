@@ -32,6 +32,7 @@ yandex-music = "0.7.0"
 
 [dev-dependencies]
 rstest = "0.26.1"
+tempfile = "3.27.0"
 
 [lints.rust]
 # Бинарный крейт не имеет внешних потребителей: `pub` здесь ничего не значит,
