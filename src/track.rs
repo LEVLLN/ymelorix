@@ -581,12 +581,13 @@ mod tests {
     /// Заглушки нужны имени файла, но не тегу: `<без названия>` в плеере
     /// выглядит как настоящее название, а отсутствие поля — как отсутствие.
     #[test]
-    fn keeps_placeholders_out_of_tags() {
+    fn test_keeps_placeholders_out_of_tags() {
         let meta = track(&["   "], None).tags();
 
-        assert_eq!(meta.title, None);
-        assert!(meta.artists.is_empty());
-        assert_eq!(meta.number, None);
+        assert_eq!(
+            (meta.title, meta.artists, meta.number),
+            (None, Vec::<String>::new(), None)
+        );
     }
 
     #[rstest]
